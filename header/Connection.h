@@ -14,12 +14,21 @@ public:
 	Connection();
 	// 释放数据库连接资源
 	~Connection();
+	// 获取底层MYSQL连接（用于错误处理）
+	MYSQL* getMYSQL() const { return _conn; }
+
 	// 连接数据库
 	bool connect(string ip, 
 		unsigned short port, 
 		string user, 
 		string password,
-		string dbname);
+		string dbname,
+		unsigned int connect_timeout = 30
+	);
+	// 检查连接是否有效
+    bool isValid() const;
+	
+	
 	// 更新操作 insert、delete、update
 	bool update(string sql);
 	// 查询操作 select

@@ -21,10 +21,13 @@ public:
 	static ConnectionPool* getConnectionPool();
 	// 给外部提供接口，从连接池中获取一个可用的空闲连接
 	shared_ptr<Connection> getConnection();
+
+	// // 打印连接池统计信息（线程安全）
+	void printStats() const;
 private:
 	// 单例#1 构造函数私有化
 	ConnectionPool();
-
+	~ConnectionPool();
 	// 从配置文件中加载配置项
 	bool loadConfigFile(); 
 
@@ -45,7 +48,7 @@ private:
 	int _connectionTimeout; // 连接池获取连接的超时时间
 
 	queue<Connection*> _connectionQue; // 存储mysql连接的队列
-	mutex _queueMutex; // 维护连接队列的线程安全互斥锁
+	mutable mutex _queueMutex; // 维护连接队列的线程安全互斥锁
 	atomic_int _connectionCnt; // 记录连接所创建的connection连接的总数量 
 	condition_variable cv; // 设置条件变量，用于连接生产线程和连接消费线程的通信
 };
