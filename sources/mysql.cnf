@@ -1,0 +1,17 @@
+# === MySQL 连接配置 ===
+[client]
+host            = 127.0.0.1      # 数据库服务器IP
+port            = 3306           # 默认MySQL端口
+user            = test           # 专用应用账号
+password        = ${DB_PASSWORD} # 从环境变量读取密码
+database        = mydatabase     # 业务数据库
+default-character-set = utf8mb4  # 字符集
+
+# === 连接池配置 ===
+[pool]
+initial_size    = 5              # 初始连接数
+max_size        = 50             # 最大连接数
+max_idle_time   = 600            # 空闲超时(秒)
+connect_timeout = 5              # 连接超时(秒)
+test_on_borrow  = true           # 借出连接时测试有效性
+validation_query= SELECT 1       # 连接检测SQL
