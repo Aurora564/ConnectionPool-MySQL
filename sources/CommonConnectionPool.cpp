@@ -1,15 +1,27 @@
 #include "CommonConnectionPool.h"
 #include "public.h"
 #define DEBUG
-// 线程安全的懒汉单例函数接口
+/**
+ * @brief 获取连接池单例实例（线程安全的懒汉模式)
+ * @return ConnectionPool* 返回连接池单例对象的指针
+ * @note 使用局部静态变量保证线程安全(C++11及以上)
+ *       该方法在第一次调用时创建连接池实例，后续调用返回同一实例
+ *       适用于多线程环境，确保只有一个连接池实例
+ *       连接池实例在程序结束时自动释放
+ */
 ConnectionPool* ConnectionPool::getConnectionPool()
 {
 	static ConnectionPool pool; // lock和unlock
 	return &pool;
 }
 
-// 加载配置
-// 加载配置文件
+/**
+ * @brief 从配置文件加载连接池配置
+ * @return bool 加载成功返回true，失败返回false
+ * @note 配置文件格式为`key=value`, 支持#注释和[section]
+ *       支持的配置项有：ip, port, username, password, dbname, initsize, maxsize, maxidletime
+ *       连接池的初始大小、最大大小、最大空闲时间等 
+ */
 bool ConnectionPool::loadConfigFile() {
     FILE *pf = fopen("mysql.cnf", "r");
     if (pf == nullptr) {
@@ -128,7 +140,19 @@ bool ConnectionPool::loadConfigFile() {
     return true;
 }
 
-// 连接池的构造
+/**
+ * @brief 连接池的构造函数
+ * @details 1. 该构造函数为支持单例模式声明为私有成员
+ *          2. 该函数在第一次调用`getConnectionPool()`时被调用
+ *          3. 该函数在调用时，调用`loadConfigFile()`，并检查配置文件是否被正确读取
+ *             3.1 当未被正确读取，直接返回则会导致连接池中连接空置，连接池未被正确启动
+ *             3.2 当被正确读取，参考 （4.）  
+ *          4. 函数创建初始数量的连接，并将连接放入连接池中
+ *          5. 启动一个新的线程`produceConnectionTask`，作为连接的生产者
+ *             5.1 该线程会在连接池中连接不足时，自动创建新的连接
+ *          6. 启动一个新的线程`scannerConnectionTask`，作为连接的回收者
+ *             6.1 该线程会定时扫描连接池中空闲连接，回收超过最大空闲时间的连接
+ */
 ConnectionPool::ConnectionPool()
 {
 	// 加载配置项了
@@ -154,32 +178,6 @@ ConnectionPool::ConnectionPool()
 	// 启动一个新的定时线程，扫描超过maxIdleTime时间的空闲连接，进行对于的连接回收
 	thread scanner(std::bind(&ConnectionPool::scannerConnectionTask, this));
 	scanner.detach();
-}
-
-// 运行在独立的线程中，专门负责生产新连接
-void ConnectionPool::produceConnectionTask() {
-    for (;;) {
-        unique_lock<mutex> lock(_queueMutex);
-        cv.wait(lock, [this] { 
-            return _connectionQue.empty() || _connectionCnt < _maxSize; 
-        });
-
-        if (_connectionCnt < _maxSize) {
-            try {
-                Connection* p = new Connection();
-                if (p->connect(_ip, _port, _username, _password, _dbname)) {
-                    p->refreshAliveTime();
-                    _connectionQue.push(p);
-                    _connectionCnt++;
-                } else {
-                    delete p;  // 连接失败时清理
-                }
-            } catch (...) {
-                LOG("创建连接异常");
-            }
-        }
-        cv.notify_all();
-    }
 }
 
 
@@ -218,34 +216,127 @@ shared_ptr<Connection> ConnectionPool::getConnection() {
     return nullptr;
 }
 
+/**
+ * @brief 连接生产线程主函数
+ * @details 在独立后台线程中运行，负责动态创建并维护数据库连接：
+ *          1. 当连接池为空或连接数未达上限时，创建新连接
+ *          2. 确保连接总数不超过配置的最大限制(_maxSize)
+ *          3. 自动处理连接创建失败的情况
+ *          4. 通过条件变量实现高效等待/通知机制
+ * 
+ * @note 关键实现细节：
+ *       - 使用unique_lock配合条件变量实现线程安全等待
+ *       - 等待条件：连接池空或未达最大连接数(_connectionCnt < _maxSize)
+ *       - 创建新连接过程：
+ *         * 加锁状态下创建Connection对象
+ *         * 尝试建立实际数据库连接
+ *         * 成功则刷新时间戳并加入队列
+ *         * 失败则立即释放资源
+ *       - 捕获所有异常避免线程意外退出
+ *       - 每次操作后通过notify_all通知可能等待的消费者
+ * 
+ * @warning 注意事项：
+ *          - 必须保证线程安全（所有共享数据访问加锁）
+ *          - 连接创建失败时应妥善释放资源
+ *          - 死循环确保线程持续运行
+ *          - 异常处理避免线程崩溃
+ * 
+ * @param[in] void 无显式参数（通过类成员访问配置）
+ * @return void 无返回值（无限循环执行）
+ */
+void ConnectionPool::produceConnectionTask() {
+    // 无限循环保持线程持续运行
+    for (;;) {
+        // 加锁并等待生产条件（自动释放锁等待，唤醒后重新获取）
+        unique_lock<mutex> lock(_queueMutex);
+        // 等待条件：连接池空或连接数未达最大连接数
+        cv.wait(lock, [this] { 
+            return _connectionQue.empty() || _connectionCnt < _maxSize; 
+        });
 
-// 扫描超过maxIdleTime时间的空闲连接，进行对于的连接回收
-void ConnectionPool::scannerConnectionTask() {
-	for (;;)
-	{
-		// 通过sleep模拟定时效果
-		this_thread::sleep_for(chrono::seconds(_maxIdleTime));
-
-		// 扫描整个队列，释放多余的连接
-		unique_lock<mutex> lock(_queueMutex);
-		while (_connectionCnt > _initSize)
-		{
-			Connection *p = _connectionQue.front();
-			if (p->getAliveeTime() >= (_maxIdleTime * 1000))
-			{
-				_connectionQue.pop();
-				_connectionCnt--;
-				lock.unlock();	// 释放锁后在进行销毁
-				delete p; // 调用~Connection()释放连接
-				lock.lock();
-			}
-			else
-			{
-				break; // 队头的连接没有超过_maxIdleTime，其它连接肯定没有
-			}
-		}
-	}
+        // 检查是否允许创建新连接（可能被虚假唤醒）
+        if (_connectionCnt < _maxSize) {
+            try {
+                // 创建新连接对象
+                Connection* p = new Connection();
+                
+                // 尝试建立实际数据库连接
+                if (p->connect(_ip, _port, _username, _password, _dbname)) {
+                    // 连接成功：记录时间戳并加入队列
+                    p->refreshAliveTime();
+                    _connectionQue.push(p);
+                    _connectionCnt++; // 原子计数器递增
+                } else {
+                    // 连接失败：立即释放资源
+                    delete p;  
+                }
+            } catch (...) {
+                // 捕获所有异常，防止线程退出
+                LOG("创建连接异常");
+            }
+        }
+        
+        // 通知可能等待的消费者线程
+        cv.notify_all();
+    }
 }
+
+
+/**
+ * @brief 空闲连接回收线程主函数
+ * @details 定期扫描并回收空闲超时的数据库连接，保持连接池健康状态：
+ *          1. 定时扫描（间隔=_maxIdleTime）
+ *          2. 只回收超过最大空闲时间的连接
+ *          3. 保证连接池至少保持_initSize个连接
+ *          4. 采用安全的方式销毁连接（避免长时间持锁）
+ * 
+ * @note 关键实现细节：
+ *       - 扫描周期与_maxIdleTime相同，保证及时回收
+ *       - 先检查连接数是否大于_initSize，避免过度回收
+ *       - 队列有序性：队头是最早创建的连接，只需检查队头
+ *       - 销毁连接时临时释放锁，减少锁的持有时间
+ *       - 使用while循环保证持续运行
+ * 
+ * @warning 注意事项：
+ *          - 必须保证线程安全（所有共享数据访问加锁）
+ *          - 连接销毁时要先释放锁，避免阻塞其他线程
+ *          - 保持至少_initSize个连接是硬性要求
+ *          - 死循环确保线程持续运行
+ */
+void ConnectionPool::scannerConnectionTask() {
+    // 无限循环保持线程持续运行
+    for (;;) {
+        // 定时扫描（间隔=maxIdleTime）
+        this_thread::sleep_for(chrono::seconds(_maxIdleTime));
+
+        // 加锁扫描空闲连接
+        unique_lock<mutex> lock(_queueMutex);
+        
+        // 只回收超出初始数量的连接（保持最小连接数）
+        while (_connectionCnt > _initSize) {
+            Connection* p = _connectionQue.front();
+            
+            // 检查队头连接是否超时（毫秒比较）
+            if (p->getAliveeTime() >= (_maxIdleTime * 1000)) {
+                _connectionQue.pop();  // 从队列移除
+                _connectionCnt--;     // 总数减1
+                
+                // 关键！释放锁后再销毁连接
+                lock.unlock();
+                delete p;  // 实际销毁连接（可能耗时）
+                lock.lock(); // 继续处理前重新加锁
+            } else {
+                // 队头未超时则后续连接也不会超时（队列有序）
+                break; 
+            }
+        }
+    }
+}
+
+
+
+
+
 
 // 析构函数
 ConnectionPool::~ConnectionPool() {
